@@ -224,28 +224,72 @@
    :rkey rkey
    :record record})
 
+(def asserted-record-keys
+  "The fields this actor states about itself rather than accepting from a caller.
+
+  A record written into an append-only store is read later by consumers who have
+  no other way to learn who wrote it or under which regime: `$type` is what an
+  ATProto consumer dispatches on, `actorDid` is the authorship claim, and
+  `scaffold` / `constitutionalStatus` are the record's own admission that it is a
+  planned scaffold rather than a ratified action. A caller may repeat any of
+  these verbatim -- records round-trip -- but may not change one, because a plan
+  that says something different from the actor that produced it is not a plan,
+  it is a forgery the store cannot detect afterwards."
+  [:$type :actorDid :legacyCell :phase :actorBoundary :scaffold :constitutionalStatus])
+
+(defn normalize-records
+  "The caller's records, as a map from collection name or positional index.
+
+  `records-for` reads this by collection name first and by index second, so a
+  sequential collection is the index-keyed shape written the obvious way and is
+  accepted as one. Anything else -- a set, a string, a number -- carries no
+  index this function can honour, and is refused rather than dropped: the plan
+  it would otherwise produce is a well-formed instruction to write a record with
+  no payload in it, which the host would execute and report as a success."
+  [records record]
+  (cond
+    (map? records)        records
+    (sequential? records) (vec records)
+    (some? records)       (throw (ex-info "records must be a map or a sequential collection"
+                                          {:reason :records/unusable-shape
+                                           :records records}))
+    (some? record)        {0 record}
+    :else                 {}))
+
+(defn assert-provenance!
+  "Refuse a supplied record that restates one of `asserted-record-keys` differently."
+  [asserted supplied]
+  (doseq [k asserted-record-keys]
+    (when (and (contains? supplied k)
+               (not= (get supplied k) (get asserted k)))
+      (throw (ex-info "record may not restate actor provenance with a different value"
+                      {:reason :record/forged-provenance
+                       :field k
+                       :asserted (get asserted k)
+                       :supplied (get supplied k)}))))
+  supplied)
+
 (defn records-for
   [spec {:keys [records record computed-at request-id]
          :as input}]
-  (let [input-records (cond
-                        (map? records) records
-                        (some? record) {0 record}
-                        :else {})
-        base {:actorDid actor-did
-              :computedAt computed-at
-              :legacyCell (:legacy-cell spec)
-              :phase (:phase spec)
-              :requestId request-id
-              :actorBoundary "cljc-migration-scaffold"
-              :scaffold true
-              :constitutionalStatus "attested-plan"}]
+  (let [input-records (normalize-records records record)
+        defaults {:computedAt computed-at
+                  :requestId request-id}]
     (map-indexed
      (fn [idx coll]
-       (let [record* (merge {:$type coll}
-                            base
-                            (or (get input-records coll)
-                                (get input-records idx)
-                                {}))
+       (let [asserted {:$type coll
+                       :actorDid actor-did
+                       :legacyCell (:legacy-cell spec)
+                       :phase (:phase spec)
+                       :actorBoundary "cljc-migration-scaffold"
+                       :scaffold true
+                       :constitutionalStatus "attested-plan"}
+             supplied (or (get input-records coll)
+                          (get input-records idx)
+                          {})
+             record* (merge defaults
+                            (assert-provenance! asserted supplied)
+                            asserted)
              rkey (safe-rkey (or (:rkey record*)
                                  (get record* "rkey")
                                  (:tid record*)

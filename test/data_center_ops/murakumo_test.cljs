@@ -1,0 +1,236 @@
+(ns data-center-ops.murakumo-test
+  "What this actor boundary must refuse, and what it must not lose.
+
+  `murakumo.cljc` is the only executable code in this repo and it is a gate: it
+  turns a request into `:mst/put-record` effects, and nothing downstream
+  re-derives them. Two failure directions matter and they are not symmetric.
+  Emitting an effect that should have been withheld writes an unattested record
+  into an append-only store, where it cannot be taken back. Dropping a field on
+  the way through is quieter still -- the host executes a well-formed
+  instruction and reports success -- so the tests below name the payload shapes
+  that must survive as carefully as the refusals.
+
+  Runs on nbb, no JVM. The source is `.cljc` with zero reader conditionals
+  (`grep -c '#?(' src/data_center_ops/murakumo.cljc` -> 0), so one runtime
+  executes all of it; there is no second branch here that could rot unseen."
+  (:require [cljs.test :refer [deftest is testing run-tests]]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            [data_center_ops.murakumo :as m]))
+
+(def every-gate
+  "An attestation for each gate the cells require."
+  (zipmap m/common-gates (repeat true)))
+
+(defn refusal
+  "The ex-data of the refusal `f` raises, or a marker naming what happened instead.
+
+  Catching `:default` rather than only `ex-info`, and reading the ex-data rather
+  than merely observing that something was thrown, is the difference between an
+  assertion about this boundary and an assertion that some call somewhere
+  crashed. A NullPointerException from three frames down is red too."
+  [f]
+  (try {::returned (f)}
+       (catch :default e
+         (or (ex-data e) {::no-ex-data (ex-message e)}))))
+
+(defn plan-record
+  "The single planned record of a ready plan."
+  [plan]
+  (:record (first (:records plan))))
+
+;; ── the gate ────────────────────────────────────────────────────────────────
+
+(deftest no-attestations-blocks-and-emits-nothing
+  (let [p (m/cell-plan :health {})]
+    (is (= :blocked (:status p)))
+    (is (= [] (:effects p)) "a blocked plan carries an empty effect list, not a missing key")
+    (is (= (set m/common-gates) (set (:missing-gates p)))
+        "and says which gates it is waiting on")))
+
+(deftest absent-attestations-block-rather-than-default-open
+  (testing "nil, an empty map and an empty set are all 'nothing has attested'"
+    (doseq [a [nil {} #{}]]
+      (let [p (m/cell-plan :health {:attestations a})]
+        (is (= :blocked (:status p)) (str "attestations " (pr-str a)))
+        (is (empty? (:effects p)) (str "attestations " (pr-str a)))))))
+
+(deftest partial-attestation-blocks-and-names-only-the-missing-gates
+  (let [held [:no-probing-baseline :did-primary-baseline]
+        p (m/cell-plan :health {:attestations (apply dissoc every-gate held)})]
+    (is (= :blocked (:status p)))
+    (is (= (set held) (set (:missing-gates p)))
+        "the gap is reported exactly, so an operator knows what to go and get")))
+
+(deftest explicit-false-is-not-an-attestation
+  (testing "a gate answered 'no' must read as missing, not as present-and-therefore-fine"
+    (let [p (m/cell-plan :health {:attestations (assoc every-gate :no-probing-baseline false)})]
+      (is (= :blocked (:status p)))
+      (is (= [:no-probing-baseline] (:missing-gates p))))))
+
+(deftest every-gate-attested-is-ready
+  (let [p (m/cell-plan :health {:attestations every-gate})]
+    (is (= :ready (:status p)))
+    (is (= [] (:missing-gates p)))
+    (is (= 1 (count (:effects p))) "one effect per collection the cell declares")))
+
+(deftest attestations-are-read-from-every-shape-the-callers-use
+  (testing "keyword map, string map, keyword set and string set all attest"
+    (doseq [a [every-gate
+               (zipmap (map name m/common-gates) (repeat true))
+               (set m/common-gates)
+               (set (map name m/common-gates))]]
+      (is (= :ready (:status (m/cell-plan :health {:attestations a})))
+          (str "attestations " (pr-str a))))))
+
+(deftest no-cell-can-be-planned-without-attestations
+  (testing "the gate is not a property of :health -- it holds for every cell in the repo"
+    (let [plans (m/all-cell-plans {})]
+      (is (= 25 (count plans)) "all declared cells were planned")
+      (is (= 25 (count (keys m/cell-specs))))
+      (is (empty? (remove #(= :blocked (:status %)) (vals plans))))
+      (is (empty? (mapcat :effects (vals plans)))))))
+
+(deftest gates-are-checked-before-the-payload
+  (testing "a blocked plan refuses on the gate and never looks at a forged record"
+    (let [p (m/cell-plan :health {:attestations {}
+                                  :record {:actorDid "did:web:somebody-else.example"}})]
+      (is (= :blocked (:status p)))
+      (is (empty? (:effects p))))))
+
+;; ── the effects ─────────────────────────────────────────────────────────────
+
+(deftest every-effect-is-a-put-record-from-this-actor
+  (let [effects (mapcat :effects (vals (m/all-cell-plans {:attestations every-gate})))]
+    (is (= 25 (count effects)))
+    (is (every? #(= :mst/put-record (:op %)) effects))
+    (is (every? #(= m/actor-did (:actor %)) effects)
+        "the envelope names this actor and no other")
+    (is (every? #(str/starts-with? (:collection %) "com.etzhayyim.data-center-ops.") effects)
+        "and writes only inside this actor's own namespace")
+    (is (every? #(seq (:rkey %)) effects) "every effect carries a record key")))
+
+(deftest each-cell-writes-its-own-collection
+  (testing "two cells sharing a collection would overwrite each other's records"
+    (let [colls (map :collection (mapcat :effects (vals (m/all-cell-plans {:attestations every-gate}))))]
+      (is (= (count colls) (count (distinct colls)))))))
+
+(deftest record-type-matches-the-collection-it-is-written-into
+  (let [effects (mapcat :effects (vals (m/all-cell-plans {:attestations every-gate})))]
+    (is (every? #(= (:collection %) (:$type (:record %))) effects)
+        "$type is what a consumer dispatches on; a record filed under one name and typed as another is unreadable")))
+
+(deftest unknown-cell-is-refused-by-name
+  (let [d (refusal #(m/cell-plan :no-such-cell {:attestations every-gate}))]
+    (is (= :no-such-cell (:cell d))
+        "and the refusal says which cell, rather than failing somewhere downstream")))
+
+;; ── the payload ─────────────────────────────────────────────────────────────
+
+(deftest payload-survives-every-accepted-records-shape
+  (testing "keyed by collection name, keyed by position, and written as a sequence"
+    (let [coll (first (:collections (:getfacility m/cell-specs)))
+          payload {:facilityId "fac-1" :racks 42}]
+      (doseq [[label records] [["collection-keyed" {coll payload}]
+                               ["index-keyed"      {0 payload}]
+                               ["vector"           [payload]]
+                               ["list"             (list payload)]]]
+        (let [r (plan-record (m/cell-plan :getfacility {:attestations every-gate :records records}))]
+          (is (= "fac-1" (:facilityId r)) label)
+          (is (= 42 (:racks r)) label))))))
+
+(deftest single-record-key-is-honoured
+  (let [r (plan-record (m/cell-plan :health {:attestations every-gate :record {:status "green"}}))]
+    (is (= "green" (:status r)))))
+
+(deftest unusable-records-shape-is-refused-not-silently-dropped
+  (testing "a shape carrying no index this boundary can honour must refuse"
+    (doseq [records [#{{:a 1}} "not-records" 7]]
+      (let [d (refusal #(m/cell-plan :health {:attestations every-gate :records records}))]
+        (is (= :records/unusable-shape (:reason d))
+            (str "records " (pr-str records)
+                 " must be refused, not turned into a put-record with no payload in it")))))
+  (testing "the shapes that are usable are not caught by that refusal"
+    (is (= :ready (:status (m/cell-plan :health {:attestations every-gate :records [{:a 1}]}))))))
+
+(deftest caller-cannot-forge-actor-provenance
+  (testing "every field the actor states about itself is refused when restated differently"
+    (doseq [[k v] {:$type "com.somebody-else.thing"
+                   :actorDid "did:web:somebody-else.example"
+                   :legacyCell "some-other-cell"
+                   :phase :ratified
+                   :actorBoundary "hand-written"
+                   :scaffold false
+                   :constitutionalStatus "ratified"}]
+      (let [d (refusal #(m/cell-plan :health {:attestations every-gate :record {k v}}))]
+        (is (= :record/forged-provenance (:reason d)) (str "field " k))
+        (is (= k (:field d)) (str "field " k " must be named in the refusal"))))))
+
+(deftest provenance-repeated-verbatim-round-trips
+  (testing "a record read back out of the store and re-planned is not a forgery"
+    (let [first-pass (plan-record (m/cell-plan :health {:attestations every-gate}))
+          replanned (plan-record (m/cell-plan :health {:attestations every-gate :record first-pass}))]
+      (is (= first-pass replanned)))))
+
+(deftest caller-data-that-is-not-provenance-is-kept
+  (testing "the refusal is narrow -- ordinary fields, and computedAt/requestId, still come from the caller"
+    (let [r (plan-record (m/cell-plan :health {:attestations every-gate
+                                               :computed-at "2026-08-30T00:00:00Z"
+                                               :request-id "req-9"
+                                               :record {:temperature 21.5}}))]
+      (is (= 21.5 (:temperature r)))
+      (is (= "2026-08-30T00:00:00Z" (:computedAt r)))
+      (is (= "req-9" (:requestId r))))))
+
+;; ── record keys ─────────────────────────────────────────────────────────────
+
+(deftest safe-rkey-strips-the-did-prefix-and-sanitises
+  (is (= "foo.example" (m/safe-rkey "did:web:foo.example")))
+  (is (= "a-b-c" (m/safe-rkey "a b/c")) "characters outside the record-key alphabet become -")
+  (is (= "keep._~-" (m/safe-rkey "keep._~-")) "and the ones inside it are left alone"))
+
+(deftest an-empty-record-key-becomes-unknown-rather-than-empty
+  (testing "an empty rkey would address the collection itself, so it must not stay empty"
+    (is (= "unknown" (m/safe-rkey "")))
+    (is (= "unknown" (m/safe-rkey nil)))
+    (is (= "unknown" (m/safe-rkey "did:web:"))
+        "the bare prefix strips to nothing and must land on the fallback too"))
+  (testing "whitespace is sanitised into a key rather than emptied"
+    (is (= "---" (m/safe-rkey "   "))
+        "sanitising runs before the blank check, so this is a real key and not the fallback")))
+
+(deftest record-key-falls-back-through-record-then-request-id-then-cell
+  (let [rkey #(:rkey (first (:records %)))]
+    (is (= "rk-1" (rkey (m/cell-plan :health {:attestations every-gate :record {:rkey "rk-1"}}))))
+    (is (= "req-2" (rkey (m/cell-plan :health {:attestations every-gate :request-id "req-2"}))))
+    (is (= "com-etzhayyim-apps-dataCenterOps-health-0"
+           (rkey (m/cell-plan :health {:attestations every-gate})))
+        "and last of all a name derived from the cell, never an empty key")))
+
+;; ── the declaration ─────────────────────────────────────────────────────────
+
+(deftest every-cell-declares-the-common-gates-and-one-collection
+  (doseq [[k spec] m/cell-specs]
+    (is (= (set m/common-gates) (set (:required-gates spec)))
+        (str k " must require the full constitutional set, not a subset"))
+    (is (= 1 (count (:collections spec))) (str k))
+    (is (seq (:legacy-cell spec)) (str k))
+    (is (= :event (:phase spec)) (str k))))
+
+(deftest actor-did-agrees-with-the-published-manifest
+  (testing "the DID the records are signed with is the one the manifest advertises"
+    (let [raw (try (fs/readFileSync "actor-manifest.jsonld" "utf8") (catch :default _ nil))]
+      (is (some? raw)
+          "actor-manifest.jsonld must be readable -- run this from the repo root; an unread file must not pass")
+      (when raw
+        (let [manifest (js->clj (js/JSON.parse raw))]
+          (is (= m/actor-did (get manifest "@id")))
+          (is (= "data-center-ops" (get manifest "name"))))))))
+
+;; ── runner ──────────────────────────────────────────────────────────────────
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [msg]
+  (when-not (cljs.test/successful? msg)
+    (set! (.-exitCode js/process) 1)))
+
+(run-tests)
