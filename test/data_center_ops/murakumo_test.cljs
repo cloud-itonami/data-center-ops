@@ -14,7 +14,7 @@
   (`grep -c '#?(' src/data_center_ops/murakumo.cljc` -> 0), so one runtime
   executes all of it; there is no second branch here that could rot unseen."
   (:require [cljs.test :refer [deftest is testing run-tests]]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             ["node:fs" :as fs]
             [data_center_ops.murakumo :as m]))
 

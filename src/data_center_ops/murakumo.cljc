@@ -1,6 +1,6 @@
 (ns data_center_ops.murakumo
   "Pure cljc actor boundary generated from manifest migration scaffold."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def actor-did
   "did:web:data-center-ops.etzhayyim.com")
