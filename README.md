@@ -111,7 +111,7 @@ would execute and report as a success:
 
 ## Tests
 
-    nbb test/data_center_ops/murakumo_test.cljk
+    kbb --backend sci test/data_center_ops/murakumo_test.cljk
 
 No JVM. The source is `.cljc` with no reader conditionals, so this one runtime
 executes all of it. The mutation battery that checks these tests still bite
