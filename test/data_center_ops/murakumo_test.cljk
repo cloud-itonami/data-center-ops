@@ -11,7 +11,7 @@
   that must survive as carefully as the refusals.
 
   Runs on nbb, no JVM. The source is `.cljc` with zero reader conditionals
-  (`grep -c '#?(' src/data_center_ops/murakumo.cljc` -> 0), so one runtime
+  (`grep -c '#?(' src/data_center_ops/murakumo.cljk` -> 0), so one runtime
   executes all of it; there is no second branch here that could rot unseen."
   (:require [cljs.test :refer [deftest is testing run-tests]]
             [kotoba.lang.text :as str]

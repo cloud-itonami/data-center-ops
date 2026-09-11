@@ -86,7 +86,7 @@ Baseline seed rows include:
 
 ## Actor boundary
 
-`src/data_center_ops/murakumo.cljc` is the only executable code here. It turns a
+`src/data_center_ops/murakumo.cljk` is the only executable code here. It turns a
 request into `:mst/put-record` effects, and nothing downstream re-derives them,
 so what it refuses and what it drops both matter.
 
@@ -111,7 +111,7 @@ would execute and report as a success:
 
 ## Tests
 
-    nbb test/data_center_ops/murakumo_test.cljs
+    nbb test/data_center_ops/murakumo_test.cljk
 
 No JVM. The source is `.cljc` with no reader conditionals, so this one runtime
 executes all of it. The mutation battery that checks these tests still bite
